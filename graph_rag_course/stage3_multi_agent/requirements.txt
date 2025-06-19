@@ -1,0 +1,9 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+streamlit>=1.33.0
+requests>=2.31.0
+neo4j>=5.14.0
+langgraph>=0.0.19
+langchain>=0.0.334
+sentence-transformers>=2.2.2
+python-dotenv>=1.0.0

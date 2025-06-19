@@ -1,0 +1,14 @@
+# Dependencies for MCP Server
+langgraph
+langchain
+spacy
+textblob
+PyMuPDF
+
+# For running the HTTP server
+fastapi
+uvicorn
+
+# For langchain community features
+langchain-community
+langchain-text-splitters
