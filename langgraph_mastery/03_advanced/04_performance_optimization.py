@@ -685,21 +685,23 @@ async def parallel_execution_node(state: OptimizedState) -> OptimizedState:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, lambda: task_func(*args, **kwargs))
         
-        # Create a copy of the state for each task to avoid sharing state between tasks
-        if state.parallel_tasks and "search" in state.parallel_tasks:
-            task_state = state.model_copy()
-            tasks.append(run_task(cached_search_information, query, task_state))
-            task_types.append("search")
-            
-        if state.parallel_tasks and "sentiment" in state.parallel_tasks:
-            task_state = state.model_copy()
-            tasks.append(run_task(cached_analyze_sentiment, query, task_state))
-            task_types.append("sentiment")
-            
-        if state.parallel_tasks and "keywords" in state.parallel_tasks:
-            task_state = state.model_copy()
-            tasks.append(run_task(cached_extract_keywords, query, task_state))
-            task_types.append("keywords")
+        # Map task names to their functions for cleaner, more scalable code
+        task_mapping = {
+            "search": cached_search_information,
+            "sentiment": cached_analyze_sentiment,
+            "keywords": cached_extract_keywords,
+        }
+
+        tasks = []
+        task_types = []
+
+        for task_name in state.parallel_tasks:
+            if task_func := task_mapping.get(task_name):
+                # Create a copy of the state for each task to avoid sharing state
+                task_state = state.model_copy()
+                # The first argument for all these functions is the text/query
+                tasks.append(run_task(task_func, query, task_state))
+                task_types.append(task_name)
         
         if not tasks:
             return state
@@ -726,23 +728,13 @@ async def parallel_execution_node(state: OptimizedState) -> OptimizedState:
             # Handle the result which is a tuple of (result, state)
             if isinstance(result, tuple) and len(result) == 2:
                 task_result, task_state = result
-                
-                # Update the results with the task result
-                if task_type == "search" and task_result is not None:
-                    updated_results["search"] = task_result
-                    if hasattr(task_state, 'execution_times') and "search" in task_state.execution_times:
-                        updated_execution_times["search"] = task_state.execution_times["search"]
-                    
-                elif task_type == "sentiment" and task_result is not None:
-                    updated_results["sentiment"] = task_result
-                    if hasattr(task_state, 'execution_times') and "sentiment" in task_state.execution_times:
-                        updated_execution_times["sentiment"] = task_state.execution_times["sentiment"]
-                    
-                elif task_type == "keywords" and task_result is not None:
-                    updated_results["keywords"] = task_result
-                    if hasattr(task_state, 'execution_times') and "keywords" in task_state.execution_times:
-                        updated_execution_times["keywords"] = task_state.execution_times["keywords"]
-                
+
+                # Update results and execution times dynamically using the task_type
+                if task_result is not None:
+                    updated_results[task_type] = task_result
+                    if hasattr(task_state, 'execution_times') and task_type in task_state.execution_times:
+                        updated_execution_times[task_type] = task_state.execution_times[task_type]
+
                 # Update cache statistics
                 if hasattr(task_state, 'cache_hits') and hasattr(task_state, 'cache_misses'):
                     total_cache_hits = max(total_cache_hits, task_state.cache_hits)

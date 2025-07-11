@@ -1,20 +1,20 @@
 """
 Human-in-the-Loop Integration in LangGraph
-
 This script demonstrates how to implement human-in-the-loop workflows in LangGraph,
 allowing for human oversight, intervention, and collaboration with AI agents.
+This updated version leverages LangGraph's built-in checkpointers and interrupts
+to simplify state management and create a more robust and idiomatic workflow.
 """
 
 import os
 import sys
-import json
 import uuid
-import logging
-import asyncio
-from typing import Dict, List, Any, Optional, Union, Callable
+from typing import Dict, List, Any, Optional
 from datetime import datetime
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+import logging
+import asyncio
 
 # Load environment variables
 load_dotenv()
@@ -27,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Check for required packages
-required_packages = ["langchain-google-genai", "langgraph"]
+required_packages = ["langchain-google-genai", "langgraph", "pydantic", "python-dotenv"]
 for package in required_packages:
     try:
         __import__(package.replace("-", "_"))
@@ -38,9 +38,11 @@ for package in required_packages:
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.graph import CompiledGraph
 
-# Define our state models
+
+# --- State Models (Pydantic) ---
 class HumanFeedback(BaseModel):
     """Feedback from a human reviewer."""
     approved: bool
@@ -48,12 +50,14 @@ class HumanFeedback(BaseModel):
     modifications: Optional[Dict[str, Any]] = None
     timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
 
+
 class ContentDraft(BaseModel):
     """A draft of content created by an AI."""
     content: str
     version: int = 1
     created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
     feedback: Optional[HumanFeedback] = None
+
 
 class HITLState(BaseModel):
     """The state for our human-in-the-loop workflow."""
@@ -65,391 +69,242 @@ class HITLState(BaseModel):
     final_content: Optional[str] = None
     errors: List[Dict[str, Any]] = Field(default_factory=list)
     metadata: Dict[str, Any] = Field(default_factory=dict)
-    human_in_loop: bool = True  # Flag to enable/disable human review
+    human_in_loop: bool = True
 
-# Helper functions
+
+# --- Helper and Node Functions ---
 def get_model(google_api_key: str):
     """Get the language model."""
     return ChatGoogleGenerativeAI(
-        model="gemini-pro",
+        model="gemini-2.0-flash",
         google_api_key=google_api_key,
         temperature=0.7,
         convert_system_message_to_human=True
     )
 
-# Node functions for our workflow
-async def generate_draft(state: Dict[str, Any], model) -> Dict[str, Any]:
-    """Generate a content draft."""
+
+async def generate_draft(state: HITLState, model) -> Dict[str, Any]:
+    """
+    Generates a content draft. This node's responsibility is now focused
+    solely on content generation, not on setting the workflow status.
+    """
     logger.info("Generating content draft")
-    state_obj = HITLState.model_validate(state)
-    
     try:
-        # Get the prompt and any previous drafts with feedback
-        prompt = state_obj.prompt
-        previous_drafts = []
-        
-        for i, draft in enumerate(state_obj.drafts):
-            if draft.feedback:
-                previous_drafts.append(f"Draft {i+1}:\n{draft.content}\n\nFeedback: {draft.feedback.comments}")
-        
-        # Prepare the messages for the model
-        messages = [
-            {"role": "system", "content": "You are a professional content creator. Create high-quality content based on the given prompt."}
+        prompt = state.prompt
+        previous_drafts_feedback = [
+            f"Draft {i + 1}:\n{draft.content}\nFeedback: {draft.feedback.comments}"
+            for i, draft in enumerate(state.drafts) if draft.feedback
         ]
-        
-        if previous_drafts:
-            messages.append({
-                "role": "user", 
-                "content": f"Create content for the following prompt:\n\n{prompt}\n\nPrevious drafts and feedback:\n\n" + "\n\n".join(previous_drafts)
-            })
-        else:
-            messages.append({
-                "role": "user", 
-                "content": f"Create content for the following prompt:\n\n{prompt}"
-            })
-        
-        # Generate the content
+        system_message = "You are a professional content creator. Create high-quality content based on the given prompt."
+        user_message_content = f"Create content for the following prompt:\n{prompt}"
+
+        if previous_drafts_feedback:
+            user_message_content += "\n\nPrevious drafts and feedback:\n" + "\n".join(previous_drafts_feedback)
+
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_message_content}
+        ]
+
         response = await model.ainvoke(messages)
-        draft_content = response.content
-        
-        # Create a new draft
-        new_draft = ContentDraft(
-            content=draft_content,
-            version=len(state_obj.drafts) + 1
-        )
-        
-        # Add the draft to the state
-        state_obj.drafts.append(new_draft)
-        state_obj.current_draft_index = len(state_obj.drafts) - 1
-        
-        # Update the status
-        if state_obj.human_in_loop:
-            state_obj.status = "awaiting_feedback"
-        else:
-            # If no human in the loop, auto-approve
-            state_obj.status = "completed"
-            state_obj.final_content = draft_content
-        
+        new_draft = ContentDraft(content=response.content, version=len(state.drafts) + 1)
+        state.drafts.append(new_draft)
+        state.current_draft_index = len(state.drafts) - 1
+        state.status = "awaiting_feedback"  # Updated status
+
     except Exception as e:
         logger.error(f"Error generating draft: {str(e)}", exc_info=True)
-        state_obj.errors.append({
-            "step": "generate_draft",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        })
-    
-    return state_obj.model_dump()
+        state.errors.append({"step": "generate_draft", "error": str(e), "timestamp": datetime.now().isoformat()})
 
-async def process_feedback(state: Dict[str, Any], model) -> Dict[str, Any]:
-    """Process human feedback on a draft."""
-    logger.info("Processing feedback")
-    state_obj = HITLState.model_validate(state)
-    
-    # Get the current draft
-    if not state_obj.drafts or state_obj.current_draft_index >= len(state_obj.drafts):
-        state_obj.errors.append({
-            "step": "process_feedback",
-            "error": "No draft available for feedback",
-            "timestamp": datetime.now().isoformat()
-        })
-        return state_obj.model_dump()
-    
-    current_draft = state_obj.drafts[state_obj.current_draft_index]
-    
-    # Check if we have feedback
-    if not current_draft.feedback:
-        logger.warning("No feedback available to process")
-        return state_obj.model_dump()
-    
-    # Process the feedback
-    feedback = current_draft.feedback
-    
-    if feedback.approved:
-        # Draft is approved, mark as completed
-        state_obj.status = "completed"
-        state_obj.final_content = current_draft.content
-        logger.info("Draft approved, workflow completed")
-    else:
-        # Draft needs revision, go back to draft generation
-        state_obj.status = "draft_in_progress"
-        logger.info("Draft rejected, generating new version")
-    
-    return state_obj.model_dump()
+    return state.model_dump()
 
-# Function to determine the next step
-def get_next_step(state: Dict[str, Any]) -> str:
-    """Determine the next step in the workflow."""
-    state_obj = HITLState.model_validate(state)
-    
-    if state_obj.status == "draft_in_progress":
-        return "generate_draft"
-    elif state_obj.status == "awaiting_feedback":
-        return "await_human"
-    elif state_obj.status == "completed":
-        return "end"
-    else:
-        # Handle error states
-        return "end"
 
-# Human-in-the-loop functions
-def await_human_feedback(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Wait for human feedback on the current draft."""
-    logger.info("Awaiting human feedback")
-    state_obj = HITLState.model_validate(state)
-    
-    # This is a special node that will pause execution until human feedback is provided
-    # The actual implementation would depend on your application's UI/UX
-    
-    return state_obj.model_dump()
-
-def provide_human_feedback(
-    state: Dict[str, Any],
-    approved: bool,
-    comments: Optional[str] = None,
-    modifications: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
-    """Provide human feedback on a draft."""
-    logger.info(f"Providing human feedback: approved={approved}")
-    state_obj = HITLState.model_validate(state)
-    
-    # Get the current draft
-    if not state_obj.drafts or state_obj.current_draft_index >= len(state_obj.drafts):
-        state_obj.errors.append({
-            "step": "provide_feedback",
-            "error": "No draft available for feedback",
-            "timestamp": datetime.now().isoformat()
-        })
-        return state_obj.model_dump()
-    
-    current_draft = state_obj.drafts[state_obj.current_draft_index]
-    
-    # Add feedback to the draft
-    current_draft.feedback = HumanFeedback(
-        approved=approved,
-        comments=comments,
-        modifications=modifications
-    )
-    
-    # Update the state
-    state_obj.drafts[state_obj.current_draft_index] = current_draft
-    
-    # Move to the next step
-    if approved:
-        state_obj.status = "completed"
-        state_obj.final_content = current_draft.content
-    else:
-        state_obj.status = "draft_in_progress"
-    
-    return state_obj.model_dump()
-
-# Create the workflow graph
-def create_hitl_graph(model):
-    """Create the human-in-the-loop workflow graph."""
+# --- Graph Definition ---
+def create_hitl_graph(model) -> CompiledGraph:
+    """
+    Creates the human-in-the-loop workflow graph using interrupts.
+    The graph's structure now explicitly handles the flow of control.
+    """
     workflow = StateGraph(HITLState)
-    
-    # Add nodes to the graph
-    workflow.add_node("generate_draft", lambda state: generate_draft(state, model))
-    workflow.add_node("process_feedback", lambda state: process_feedback(state, model))
-    workflow.add_node("await_human", await_human_feedback)
-    
-    # Add edges
-    workflow.add_edge("generate_draft", "await_human")
-    workflow.add_edge("await_human", "process_feedback")
-    workflow.add_edge("process_feedback", get_next_step)
-    
-    # Set the entry point
-    workflow.set_entry_point(get_next_step)
-    
-    # Compile the graph
-    return workflow.compile()
 
-# Human-in-the-Loop Workflow Manager
+    async def call_generate_draft(state_dict: dict) -> dict:
+        state = HITLState.model_validate(state_dict)
+        return await generate_draft(state, model)
+
+    def finalize_draft(state: HITLState) -> dict:
+        current_draft = state.drafts[state.current_draft_index]
+        state.final_content = current_draft.content
+        state.status = "completed"
+        return state.model_dump()
+
+    workflow.add_node("generate_draft", call_generate_draft)
+    workflow.add_node("human_review", lambda s: s)
+    workflow.add_node("finalize", finalize_draft)
+
+    def should_request_review(state_dict: dict) -> str:
+        state = HITLState.model_validate(state_dict)
+        if state.human_in_loop:
+            logger.info("Draft requires human review.")
+            return "human_review"
+        else:
+            logger.info("Auto-approving draft as human-in-loop is disabled.")
+            state.final_content = state.drafts[-1].content if state.drafts else ""
+            state.status = "completed"
+            return "finalize"
+
+    def route_after_feedback(state_dict: dict) -> str:
+        state = HITLState.model_validate(state_dict)
+        current_draft = state.drafts[state.current_draft_index]
+        print(current_draft.feedback)
+        if not current_draft.feedback:
+            logger.error("No feedback found on current draft. Ending workflow.")
+            state.status = "completed"
+            return 'finalize'
+        if current_draft.feedback.approved:
+            logger.info("Draft approved. Completing workflow.")
+            state.final_content = current_draft.content
+            state.status = "completed"
+            return 'finalize'
+        else:
+            logger.info("Draft rejected. Returning to generate a new version.")
+            state.status = "draft_in_progress"
+            return "generate_draft"
+
+    workflow.set_entry_point("generate_draft")
+
+    workflow.add_conditional_edges(
+        "generate_draft",
+        should_request_review,
+        {"human_review": "human_review", "finalize": "finalize"}
+    )
+
+    workflow.add_conditional_edges(
+        "human_review",
+        route_after_feedback,
+        {"generate_draft": "generate_draft", "finalize": "finalize"}
+    )
+    workflow.add_edge("finalize", END)
+
+    checkpointer = MemorySaver()
+    return workflow.compile(checkpointer=checkpointer, interrupt_before=["human_review"])
+
+
+# --- Workflow Manager ---
 class HITLWorkflowManager:
-    """Manager for human-in-the-loop workflows."""
-    
+    """
+    Manages human-in-the-loop workflows using LangGraph's persistence.
+    This class is now much simpler as it doesn't manage state directly.
+    """
     def __init__(self, google_api_key: str):
-        """Initialize the manager."""
         self.model = get_model(google_api_key)
         self.graph = create_hitl_graph(self.model)
-        self.active_workflows: Dict[str, Dict[str, Any]] = {}
-    
+
     async def create_workflow(self, prompt: str, human_in_loop: bool = True) -> str:
-        """Create a new workflow."""
+        """Creates and starts a new workflow, returning its unique ID."""
         task_id = str(uuid.uuid4())
-        
-        # Initialize the state
-        state = HITLState(
+        config = {"configurable": {"thread_id": task_id}}
+        initial_state = HITLState(
             task_id=task_id,
             prompt=prompt,
             human_in_loop=human_in_loop,
-            metadata={
-                "created_at": datetime.now().isoformat()
-            }
+            metadata={"created_at": datetime.now().isoformat()}
         )
-        
-        # Start the workflow
-        result = await self.graph.ainvoke(state.model_dump())
-        
-        # Store the workflow state
-        self.active_workflows[task_id] = result
-        
+        await self.graph.ainvoke(initial_state.model_dump(), config)
         return task_id
-    
-    def get_workflow_state(self, task_id: str) -> Optional[Dict[str, Any]]:
-        """Get the current state of a workflow."""
-        return self.active_workflows.get(task_id)
-    
-    async def provide_feedback(
-        self,
-        task_id: str,
-        approved: bool,
-        comments: Optional[str] = None,
-        modifications: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """Provide human feedback for a workflow."""
-        if task_id not in self.active_workflows:
-            raise ValueError(f"Workflow {task_id} not found")
-        
-        # Get the current state
-        state = self.active_workflows[task_id]
-        
-        # Add the feedback
-        state = provide_human_feedback(state, approved, comments, modifications)
-        
-        # Continue the workflow
-        result = await self.graph.ainvoke(state)
-        
-        # Update the stored state
-        self.active_workflows[task_id] = result
-        
-        return result
-    
-    def get_current_draft(self, task_id: str) -> Optional[Dict[str, Any]]:
-        """Get the current draft for a workflow."""
-        state = self.get_workflow_state(task_id)
-        if not state:
-            return None
-        
-        state_obj = HITLState.model_validate(state)
-        if not state_obj.drafts or state_obj.current_draft_index >= len(state_obj.drafts):
-            return None
-        
-        return state_obj.drafts[state_obj.current_draft_index].model_dump()
-    
-    def is_awaiting_feedback(self, task_id: str) -> bool:
-        """Check if a workflow is awaiting feedback."""
-        state = self.get_workflow_state(task_id)
-        if not state:
-            return False
-        
-        return state.get("status") == "awaiting_feedback"
-    
-    def is_completed(self, task_id: str) -> bool:
-        """Check if a workflow is completed."""
-        state = self.get_workflow_state(task_id)
-        if not state:
-            return False
-        
-        return state.get("status") == "completed"
-    
-    def get_final_content(self, task_id: str) -> Optional[str]:
-        """Get the final content for a completed workflow."""
-        state = self.get_workflow_state(task_id)
-        if not state:
-            return None
-        
-        return state.get("final_content")
 
-# Interactive CLI for the human-in-the-loop example
+    def get_workflow_state(self, task_id: str) -> Optional[HITLState]:
+        """Gets the current state of a workflow from the checkpointer."""
+        config = {"configurable": {"thread_id": task_id}}
+        snapshot = self.graph.get_state(config)
+        return HITLState.model_validate(snapshot.values) if snapshot else None
+
+    async def provide_feedback(self, task_id: str, approved: bool, comments: Optional[str] = None) -> HITLState:
+        """Provides feedback and resumes the workflow."""
+        config = {"configurable": {"thread_id": task_id}}
+        state = self.get_workflow_state(task_id)
+        if not state:
+            raise ValueError(f"Workflow {task_id} not found or has no state.")
+
+        current_draft = state.drafts[state.current_draft_index]
+        current_draft.feedback = HumanFeedback(approved=approved, comments=comments)
+        state.status = "approved" if approved else "rejected"
+        self.graph.update_state(config, state.model_dump())
+        # Resume the workflow
+        print(state.drafts[state.current_draft_index].feedback)
+        result = await self.graph.ainvoke(None, config)
+        return HITLState.model_validate(result)
+
+    def get_current_draft(self, task_id: str) -> Optional[ContentDraft]:
+        state = self.get_workflow_state(task_id)
+        if state and state.drafts:
+            return state.drafts[state.current_draft_index]
+        return None
+
+
+# --- Interactive CLI (Updated for new manager) ---
 async def run_interactive_cli():
     """Run an interactive CLI for the human-in-the-loop example."""
     print("=" * 80)
-    print("Human-in-the-Loop Integration in LangGraph")
+    print("Human-in-the-Loop Integration in LangGraph (Refactored)")
     print("=" * 80)
-    print("\nThis example demonstrates how to implement human-in-the-loop workflows,")
-    print("allowing for human oversight, intervention, and collaboration with AI agents.")
-    
-    # Get the Google API key from environment
+
     google_api_key = os.getenv("GOOGLE_API_KEY")
     if not google_api_key:
-        print("ERROR: GOOGLE_API_KEY not found in environment variables")
-        print("Please set your GOOGLE_API_KEY in the .env file")
+        print("\nERROR: GOOGLE_API_KEY not found. Please set it in a .env file.")
         return
-    
-    # Create the workflow manager
+
     manager = HITLWorkflowManager(google_api_key)
-    
-    # Get user input
-    print("\nEnter a content creation prompt:")
-    prompt = input("> ")
-    
-    # Ask if human review should be enabled
-    print("\nEnable human review? (y/n)")
-    human_in_loop = input("> ").lower() == "y"
-    
-    # Create the workflow
+
+    prompt = input("\nEnter a content creation prompt:\n> ")
+
+    human_in_loop_input = input("\nEnable human review? (y/n) [y]: ").lower()
+    human_in_loop = human_in_loop_input != 'n'
+
     print("\nCreating workflow...")
     task_id = await manager.create_workflow(prompt, human_in_loop)
     print(f"Workflow created with ID: {task_id}")
-    
-    # Main interaction loop
+
     while True:
-        # Get the current state
         state = manager.get_workflow_state(task_id)
-        state_obj = HITLState.model_validate(state)
-        
-        # Display the current status
+        if not state:
+            print("Workflow has ended unexpectedly.")
+            break
+
         print("\n" + "=" * 80)
-        print(f"Status: {state_obj.status}")
+        print(f"Workflow Status: {state.status.upper()}")
         print("=" * 80)
-        
-        # If we're awaiting feedback, show the draft and get feedback
-        if state_obj.status == "awaiting_feedback":
-            current_draft = manager.get_current_draft(task_id)
-            if current_draft:
-                print(f"\nDraft {current_draft['version']}:")
-                print("-" * 40)
-                print(current_draft["content"])
-                print("-" * 40)
-                
-                print("\nApprove this draft? (y/n)")
-                approved = input("> ").lower() == "y"
-                
-                if not approved:
-                    print("\nProvide feedback comments:")
-                    comments = input("> ")
-                    
-                    # Process the feedback
-                    print("\nProcessing feedback...")
-                    await manager.provide_feedback(task_id, approved, comments)
-                else:
-                    # Approve the draft
-                    print("\nApproving draft...")
-                    await manager.provide_feedback(task_id, approved, "Looks good!")
-            else:
-                print("No draft available")
-                break
-        
-        # If the workflow is completed, show the final content
-        elif state_obj.status == "completed":
+        print(state.status)
+        if state.status == "completed":
             print("\nWorkflow completed!")
             print("\nFinal Content:")
             print("-" * 40)
-            print(state_obj.final_content)
+            print(state.final_content)
             print("-" * 40)
             break
-        
-        # If there's an error or other status, break the loop
+
+        current_draft = manager.get_current_draft(task_id)
+        if current_draft:
+            # print(f"\nDraft {current_draft.version}:")
+            # print("-" * 40)
+            # print(current_draft.content)
+            # print("-" * 40)
+
+            approved_input = input("\nApprove this draft? (y/n) [y]: ").lower()
+            approved = approved_input != 'n'
+            comments = None
+            
+            if not approved:
+                comments = input("\nProvide feedback comments for the next version:\n> ")
+
+            print("\nProcessing feedback...")
+            print(approved, comments)
+            await manager.provide_feedback(task_id, approved, comments or "Approved")
         else:
-            print(f"Workflow status: {state_obj.status}")
-            if state_obj.errors:
-                print("\nErrors:")
-                for error in state_obj.errors:
-                    print(f"- {error.get('step', 'unknown')}: {error.get('error', 'unknown error')}")
+            print("Error: Workflow is paused but no draft is available.")
             break
-    
+
     print("\nThank you for using the Human-in-the-Loop example!")
 
-# Main function
+
 if __name__ == "__main__":
     asyncio.run(run_interactive_cli())
